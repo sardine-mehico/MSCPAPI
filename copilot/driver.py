@@ -106,6 +106,13 @@ class Copilot(AbstractProvider):
                 pass  # resume an existing conversation by id; skip create
             else:
                 response = session.post(self.conversation_url)
+                if response.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"Login expired (HTTP {response.status_code} creating a conversation). "
+                        "Your Microsoft session is no longer valid — re-run the login flow "
+                        "(Docker: redeploy the login stack; local: `python -m copilot login`). "
+                        f"Upstream said: {response.text[:300]}"
+                    )
                 raise_for_status(response)
                 conversation_id = response.json().get("id")
                 if return_conversation:
@@ -129,7 +136,15 @@ class Copilot(AbstractProvider):
                 "mode": "chat",
             }).encode()
 
-            wss = session.ws_connect(websocket_url)
+            try:
+                wss = session.ws_connect(websocket_url)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Chat socket failed to connect: {exc}. A 401/403 here usually means "
+                    "the Microsoft session or chat access token expired — re-run the login "
+                    "flow. A Cloudflare/region block usually means the host IP is blocked — "
+                    "set COPILOT_PROXY to a proxy in a supported region."
+                ) from exc
             wss.send(send_frame, CurlWsFlag.TEXT)
             yield from self._read_stream(wss, send_frame, timeout)
 

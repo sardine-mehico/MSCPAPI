@@ -11,6 +11,11 @@ docs/
 
 # Local config / secrets
 config.json
+credentials.md
+
+# Keep the repo opaque (no project description on GitHub)
+CLAUDE.md
+MANUAL.md
 
 # Dev files
 test.py

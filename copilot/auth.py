@@ -6,6 +6,7 @@ transparently refreshes it from the persistent browser profile when it goes stal
 """
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,7 @@ def load_auth(
     profile_dir: str = DEFAULT_PROFILE_DIR,
     max_age: int = AUTH_MAX_AGE,
     proxy: Optional[str] = None,
-    auto_login: bool = True,
+    auto_login: Optional[bool] = None,
 ) -> dict:
     """Return ``{cookies, access_token, saved_at}`` for the signed-in user.
 
@@ -37,12 +38,22 @@ def load_auth(
     instead of failing — so the very first call just works. Set
     ``auto_login=False`` (or run headless/CI) to get a ``RuntimeError`` instead.
 
+    ``auto_login`` defaults to the ``COPILOT_AUTO_LOGIN`` env var (``"0"``/``"false"``
+    -> False), else True. Headless deployments (e.g. the server container) set
+    ``COPILOT_AUTO_LOGIN=0`` so a missing session raises cleanly instead of trying
+    to pop a GUI that can't render — sign-in is done separately via the login flow.
+
     Intended for the pure-HTTP :class:`copilot.client.Copilot` path::
 
         auth = load_auth()
         Copilot().create_completion(..., cookies=auth["cookies"],
                                     access_token=auth["access_token"])
     """
+    if auto_login is None:
+        auto_login = os.environ.get("COPILOT_AUTO_LOGIN", "1").strip().lower() not in (
+            "0", "false", "no", "off", ""
+        )
+
     p = Path(path)
     if p.exists():
         try:
@@ -67,8 +78,10 @@ def load_auth(
     # No signed-in session in the profile.
     if not auto_login:
         raise RuntimeError(
-            "Not signed in (no access token in the browser profile). "
-            "Run `python -m copilot login` and sign in first."
+            "Login expired or not signed in: no valid Microsoft access token in the "
+            "browser profile. Re-run the login flow — Docker: deploy the login stack "
+            "(docker-compose.login.yml) and sign in via noVNC; local: "
+            "`python -m copilot login`."
         )
 
     # First-time use: create the session interactively, then return its auth.

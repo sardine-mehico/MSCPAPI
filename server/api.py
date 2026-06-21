@@ -1,5 +1,7 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import logging
+import os
 import threading
 import time
 
@@ -18,8 +20,13 @@ from .openai_format import (
 from .prompt import messages_to_prompt
 from .schemas import ChatCompletionRequest
 
+logger = logging.getLogger("mscpapi")
+
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
-client = CopilotClient()
+# COPILOT_PROXY (scheme://user:pass@host:port) routes BOTH the auth refresh and
+# every chat request through a proxy — the escape hatch when Cloudflare blocks the
+# host's IP. Unset = direct.
+client = CopilotClient(proxy=os.environ.get("COPILOT_PROXY") or None)
 
 # Copilot's per-account chat socket doesn't tolerate concurrent conversations
 # from one process (parallel requests error out or hang). This server bridges a
@@ -53,6 +60,7 @@ def _stream(prompt: str, model: str, conversation_id=None):
                 )
             )
     except Exception as exc:  # surface errors to the client instead of hanging
+        logger.exception("stream chat failed")  # full traceback to container logs
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
         )
@@ -88,6 +96,7 @@ def chat_completions(req: ChatCompletionRequest):
         with _upstream_lock:  # serialize: one upstream chat at a time
             reply = client.chat(prompt, conversation_id=req.conversation_id)
     except Exception as exc:
+        logger.exception("chat completion failed")  # full traceback to container logs
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},

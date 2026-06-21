@@ -180,7 +180,14 @@ class BrowserCopilot:
             self._pw = sync_playwright().start()
             launch_kwargs = dict(
                 headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    # Required to launch Chromium as root inside a container, and
+                    # to avoid crashes on the small default /dev/shm. Harmless on
+                    # a normal desktop. See docker-compose (shm_size, ipc: host).
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             )
             if self.proxy:
                 launch_kwargs["proxy"] = self._parse_proxy(self.proxy)
@@ -191,8 +198,14 @@ class BrowserCopilot:
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.set_default_timeout(self.nav_timeout * 1000)
             self._page.goto(COPILOT_URL, wait_until="domcontentloaded")
-            # Give Cloudflare a moment to clear on first paint.
-            self._page.wait_for_load_state("networkidle", timeout=self.nav_timeout * 1000)
+            # Give Cloudflare a moment to clear and let MSAL silently renew the
+            # token on load (so access_token() reads a fresh value, not a stale
+            # one). Best-effort: the Microsoft sign-in page may never reach
+            # "networkidle", so a timeout here is fine — don't fail start().
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=self.nav_timeout * 1000)
+            except PlaywrightError:
+                pass
         except PlaywrightError as exc:
             self.close()
             raise ConnectionError(f"Failed to start browser: {exc}") from exc

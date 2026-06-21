@@ -1,4 +1,8 @@
 curl_cffi>=0.15
-playwright>=1.60
+# Pinned to match the Playwright Docker base image tag (mcr.microsoft.com/
+# playwright/python:v1.60.0-noble). The pip version MUST equal the image's
+# bundled-browser version or Chromium won't be found at runtime. Bump both
+# together (Dockerfile + here) when upgrading.
+playwright==1.60.0
 fastapi>=0.110
 uvicorn>=0.29

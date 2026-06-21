@@ -1,0 +1,63 @@
+# =============================================================================
+# Standalone server stack — deploy as-is in Portainer (or `docker compose up -d`).
+# Pulls the prebuilt image from GHCR; no source checkout needed.
+#
+# QUICK START
+#   0) Create the shared session volume (once):
+#        docker volume create mscpapi_session
+#
+#   1) LOG IN (one time, then ~every 90 days). Use the login stack:
+#        deploy docker-compose.login.yml, then on your machine:
+#          ssh -L 6080:localhost:6080 <vps>
+#          open http://localhost:6080/vnc.html  -> sign in to Microsoft
+#        wait for "[OK] Signed in", then REMOVE the login stack.
+#
+#   2) START THIS SERVER STACK. Reach it via an SSH tunnel:
+#          ssh -L 8000:localhost:8000 <vps>
+#        then point any OpenAI client at  http://localhost:8000/v1
+#        (model: "copilot"; api_key: any non-empty string, it's ignored)
+#          curl http://localhost:8000/v1/chat/completions \
+#            -H "Content-Type: application/json" \
+#            -d '{"messages":[{"role":"user","content":"Hello!"}]}'
+#
+# RE-LOGIN when calls start returning "Login expired or not signed in..." —
+# just repeat step 1.
+#
+# ENV KNOBS (below): MAX_CONCURRENCY (keep 1-3), COPILOT_PROXY, COPILOT_DRIVER.
+#
+# IF CLOUDFLARE BLOCKS THE VPS IP (errors like "Chat socket failed to connect"):
+#   A) Residential proxy — set COPILOT_PROXY here AND in the login stack. Use a
+#      STICKY (non-rotating) residential IP in a Copilot-supported region.
+#   B) Browser driver — set COPILOT_DRIVER: "browser" (real Chromium, holds
+#      genuine Cloudflare clearance). Reuses the same volume; no re-login.
+#   You can combine A + B.
+#
+# SECURITY: ports are bound to 127.0.0.1 (loopback) — reach them only via SSH
+# tunnel. There is no app auth; do NOT publish these ports without an
+# authenticating reverse proxy in front.
+# =============================================================================
+services:
+  mscpapi:
+    image: ghcr.io/sardine-mehico/mscpapi:latest
+    container_name: mscpapi
+    restart: unless-stopped
+    environment:
+      MODE: server
+      COPILOT_AUTO_LOGIN: "0"   # headless: never try to open a sign-in GUI
+      MAX_CONCURRENCY: "3"      # accept at most N in-flight requests (rest -> 503)
+      PORT: "8000"
+      # --- optional fixes for a blocked VPS IP (see header) ---
+      # COPILOT_PROXY: "http://user:pass@host:port"   # or socks5://host:port
+      # COPILOT_DRIVER: "browser"
+    ports:
+      - "127.0.0.1:8000:8000"   # loopback only — expose via SSH tunnel / reverse proxy
+    volumes:
+      - mscpapi_session:/app/session
+    shm_size: "2gb"   # Chromium needs more than the 64MB default
+    ipc: host
+    init: true
+
+volumes:
+  mscpapi_session:
+    external: true
+    name: mscpapi_session

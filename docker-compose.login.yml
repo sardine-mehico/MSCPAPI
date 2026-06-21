@@ -1,0 +1,39 @@
+# =============================================================================
+# ONE-TIME LOGIN stack. Deploy it, sign in over noVNC, then REMOVE it and deploy
+# docker-compose.yml. Shares the same external volume, so the server reuses the
+# saved session. Repeat only when login expires (~every 90 days).
+#
+#   0) docker volume create mscpapi_session          # once (shared with server)
+#   1) deploy this stack (Portainer) or:  docker compose -f docker-compose.login.yml up
+#   2) on your machine:  ssh -L 6080:localhost:6080 <vps>
+#   3) open http://localhost:6080/vnc.html  -> sign in to your Microsoft account
+#      (password + MFA + any Cloudflare check)
+#   4) wait for "[OK] Signed in. Session saved" — the container exits 0
+#   5) REMOVE this stack, then deploy docker-compose.yml
+#
+# If logging in from a blocked region/IP, set COPILOT_PROXY to the SAME proxy you
+# use on the server stack (sticky residential IP in a supported region).
+#
+# SECURITY: noVNC is bound to 127.0.0.1 — only reachable through the SSH tunnel.
+# =============================================================================
+services:
+  mscpapi-login:
+    image: ghcr.io/sardine-mehico/mscpapi:latest
+    container_name: mscpapi-login
+    environment:
+      MODE: login
+      NOVNC_PORT: "6080"
+      COPILOT_LOGIN_TIMEOUT: "900"   # 15 min to complete the sign-in
+      # COPILOT_PROXY: "http://user:pass@host:port"
+    ports:
+      - "127.0.0.1:6080:6080"   # loopback only — expose via SSH tunnel
+    volumes:
+      - mscpapi_session:/app/session
+    shm_size: "2gb"
+    ipc: host
+    init: true
+
+volumes:
+  mscpapi_session:
+    external: true
+    name: mscpapi_session

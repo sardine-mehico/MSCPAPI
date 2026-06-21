@@ -23,6 +23,7 @@ anonymous consumer chat is available), or ``proxy=...`` to route through a
 supported region.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Union
@@ -83,12 +84,23 @@ class CopilotClient:
         anonymous: bool = False,
         proxy: Optional[str] = None,
         max_age: int = AUTH_MAX_AGE,
+        driver: Optional[str] = None,
     ):
-        self._driver = Copilot()
+        # Driver: "http" (default, pure curl_cffi) or "browser" (Playwright). The
+        # browser driver runs a real Chromium that holds genuine Cloudflare
+        # clearance, so it's the fallback when a datacenter/VPS IP gets blocked.
+        # Defaults to the COPILOT_DRIVER env var, else "http".
+        kind = (driver or os.environ.get("COPILOT_DRIVER") or "http").strip().lower()
+        self._driver_kind = "browser" if kind == "browser" else "http"
         self._anonymous = anonymous
         self._proxy = proxy
         self._max_age = max_age
         self._auth: Optional[dict] = None
+        if self._driver_kind == "browser":
+            from .browser import BrowserCopilot
+            self._driver = BrowserCopilot(headless=True, proxy=proxy)
+        else:
+            self._driver = Copilot()
 
     def stream(
         self,
@@ -102,6 +114,14 @@ class CopilotClient:
         continues that conversation. Read ``.conversation_id`` on the returned
         stream (during/after iteration) to continue the chat later.
         """
+        if self._driver_kind == "browser":
+            # The browser driver authenticates via its own persistent profile and
+            # always starts a fresh conversation, so cookies/access_token and
+            # conversation_id don't apply. Multi-turn context is preserved upstream
+            # because the server flattens the whole history into ``prompt``.
+            chunks = self._driver.create_completion(prompt, stream=True, **kwargs)
+            return ChatStream(chunks, None)
+
         auth = self._fresh_auth()
         kw = dict(
             stream=True,

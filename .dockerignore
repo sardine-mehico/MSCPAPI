@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+session/
+docs/
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+examples/
+tests/
+*.md
+config.json
+test.py
+main.py
