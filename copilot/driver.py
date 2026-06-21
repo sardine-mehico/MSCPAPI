@@ -8,6 +8,7 @@ See :mod:`copilot.browser` for the Playwright-backed fallback.
 
 import json
 import time
+import uuid
 from select import select
 from typing import Dict, Optional
 from urllib.parse import quote
@@ -21,7 +22,6 @@ from curl_cffi.requests import Session, CurlWsFlag
 # honour a deadline. CURL_SOCKET_BAD is libcurl's "no active socket" sentinel.
 _CURL_SOCKET_BAD = -1
 
-from .challenges import solve_copilot_challenge, solve_hashcash
 from .models import AbstractProvider, Conversation, ImageResponse, ImageType
 from .utils import drain_json, is_accepted_format, raise_for_status, to_bytes
 
@@ -53,10 +53,9 @@ class Copilot(AbstractProvider):
         """Stream a Copilot reply to ``prompt``.
 
         Runs Copilot's own chat protocol over a Cloudflare-impersonating
-        ``curl_cffi`` session: ``POST /c/api/conversations`` then a chat
-        WebSocket (``send`` -> proof-of-work ``challenge`` -> ``appendText``* ->
-        ``done``). The challenge is solved in-process (see
-        :mod:`copilot.challenges`); no browser is required.
+        ``curl_cffi`` session: ``POST /c/api/start`` to open a conversation, then a
+        chat WebSocket (a single ``send`` frame -> ``appendText``* -> ``done``). No
+        browser and no proof-of-work step are required.
 
         ``prompt`` is the user message sent straight to the chat socket (the
         protocol has no separate system/role channel). Anonymous by default;
@@ -87,7 +86,9 @@ class Copilot(AbstractProvider):
         #     wrong-audience token 401s the WS upgrade, while *no* token makes the
         #     chat backend treat the session as anonymous -> chat-service-
         #     unavailable in geo-restricted regions (e.g. India).
-        websocket_url = self.websocket_url
+        # api-version=2 plus a per-connection clientSessionId is what the current
+        # Copilot chat backend expects; the signed-in identity rides on accessToken.
+        websocket_url = f"{self.websocket_url}&clientSessionId={uuid.uuid4()}"
         if access_token:
             websocket_url = f"{websocket_url}&accessToken={quote(access_token)}"
 
@@ -105,16 +106,31 @@ class Copilot(AbstractProvider):
             elif conversation_id is not None:
                 pass  # resume an existing conversation by id; skip create
             else:
-                response = session.post(self.conversation_url)
+                # Current handshake: POST /c/api/start returns currentConversationId
+                # and sets the cookies the chat socket needs. (The older
+                # /c/api/conversations -> {"id"} flow yields a conversation the
+                # redesigned backend rejects mid-stream with "invalid-event".)
+                response = session.post(
+                    f"{self.url}/c/api/start",
+                    headers={"content-type": "application/json"},
+                    json={
+                        "timeZone": "America/Los_Angeles",
+                        "startNewConversation": True,
+                        "teenSupportEnabled": True,
+                        "correctPersonalizationSetting": True,
+                        "performUserMerge": True,
+                        "deferredDataUseCapable": True,
+                    },
+                )
                 if response.status_code in (401, 403):
                     raise RuntimeError(
-                        f"Login expired (HTTP {response.status_code} creating a conversation). "
+                        f"Login expired (HTTP {response.status_code} starting a conversation). "
                         "Your Microsoft session is no longer valid — re-run the login flow "
                         "(Docker: redeploy the login stack; local: `python -m copilot login`). "
                         f"Upstream said: {response.text[:300]}"
                     )
                 raise_for_status(response)
-                conversation_id = response.json().get("id")
+                conversation_id = response.json().get("currentConversationId")
                 if return_conversation:
                     yield Conversation(conversation_id, session.cookies.jar)
 
@@ -145,20 +161,18 @@ class Copilot(AbstractProvider):
                     "flow. A Cloudflare/region block usually means the host IP is blocked — "
                     "set COPILOT_PROXY to a proxy in a supported region."
                 ) from exc
-            wss.send(send_frame, CurlWsFlag.TEXT)
-            yield from self._read_stream(wss, send_frame, timeout)
+            wss.send(send_frame, CurlWsFlag.TEXT)  # sent exactly once
+            yield from self._read_stream(wss, timeout)
 
-    def _read_stream(self, wss, send_frame: bytes, timeout: int, idle_timeout: int = 60):
-        """Consume chat-socket frames, solving challenges, yielding text/images.
+    def _read_stream(self, wss, timeout: int, idle_timeout: int = 60):
+        """Consume chat-socket frames, yielding text/images.
 
         ``idle_timeout`` bounds how long we wait for the *next* frame: the chat
         backend normally answers within a second, so prolonged silence means a
-        stalled socket (or a challenge we failed to answer) — we raise rather
-        than block for the full ``timeout``.
+        stalled socket — we raise rather than block for the full ``timeout``.
         """
         buffer = b""
         is_started = False
-        answered = False
         image_prompt = None
         last_msg = None
 
@@ -182,24 +196,7 @@ class Copilot(AbstractProvider):
             for msg in messages:
                 last_msg = msg
                 event = msg.get("event")
-                if event == "challenge" and not answered:
-                    token = self._solve_challenge(msg)
-                    if token is None:
-                        raise RuntimeError(
-                            f"Unsolvable Copilot challenge (method={msg.get('method')!r}). "
-                            "Microsoft may have escalated to a browser-only challenge; "
-                            "fall back to copilot.browser.BrowserCopilot."
-                        )
-                    wss.send(json.dumps({
-                        "event": "challengeResponse",
-                        "token": token,
-                        "method": msg.get("method"),
-                        "id": msg.get("id"),
-                    }).encode(), CurlWsFlag.TEXT)
-                    answered = True
-                    # The client re-sends the held message after a challenge.
-                    wss.send(send_frame, CurlWsFlag.TEXT)
-                elif event == "appendText":
+                if event == "appendText":
                     is_started = True
                     yield msg.get("text")
                 elif event == "generatingImage":
@@ -218,6 +215,11 @@ class Copilot(AbstractProvider):
                             "create_completion(..., proxy='http://user:pass@host:port')."
                         )
                     raise RuntimeError(f"Copilot error: {code}")
+                # Any other event (challenge, received, startMessage, partCompleted,
+                # connected, titleUpdate, suggestedFollowups, ...) is a benign ack in
+                # the redesigned protocol — ignore it. The backend no longer has a
+                # proof-of-work step; replying with a challengeResponse or sending a
+                # second 'send' frame is what the server rejects as "invalid-event".
 
         if not is_started:
             raise RuntimeError(f"Invalid response: {last_msg}")
@@ -248,25 +250,3 @@ class Copilot(AbstractProvider):
                 if remaining <= 0:
                     return None
                 select([sock_fd], [], [], min(0.5, remaining))
-
-    @staticmethod
-    def _solve_challenge(msg: dict):
-        """Return the challenge-response token, or ``None`` if we can't solve it.
-
-        Copilot's chat socket precedes the answer with a challenge frame that the
-        client must acknowledge. An *empty* challenge (no ``method``/``parameter``)
-        only needs an acknowledging response, so we return an empty token; the
-        proof-of-work variants are computed in :mod:`copilot.challenges`. A
-        ``None`` return means the challenge needs a browser-solved token (e.g. a
-        Cloudflare Turnstile) and the caller should surface that.
-        """
-        method = msg.get("method")
-        parameter = msg.get("parameter")
-        if not method and not parameter:
-            return ""  # empty/no-op challenge: just acknowledge it
-        if method == "hashcash" and parameter:
-            return solve_hashcash(parameter)
-        if method == "copilot" and parameter:
-            return solve_copilot_challenge(parameter)
-        # 'cloudflare' (Turnstile) / unknown PoW needs a browser-solved token.
-        return None

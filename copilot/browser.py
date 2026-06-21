@@ -17,14 +17,14 @@ It exposes the same ``create_completion(prompt, stream=...)`` generator API as
 :class:`copilot.client.Copilot`, so it is a drop-in replacement.
 
 PROTOCOL ASSUMPTIONS (verify at runtime against a live session):
-  * Conversation create:  POST /c/api/conversations  -> {"id": "..."}
+  * Conversation create:  POST /c/api/start  -> {"currentConversationId": "..."}
   * Chat socket:          wss://copilot.microsoft.com/c/api/chat?api-version=2
-                          (with &accessToken=<token> when signed in)
-  * Send frame:           {"event":"send","conversationId":...,
+                          &clientSessionId=<uuid> (and &accessToken=<token> when signed in)
+  * Send frame (once):    {"event":"send","conversationId":...,
                            "content":[{"type":"text","text":...}],"mode":"chat"}
   * Stream frames:        {"event":"appendText","text":...}, then {"event":"done"}
-These mirror the captured protocol in ``client.py``. If Microsoft changes them,
-adjust the JS templates below.
+There is no proof-of-work challenge step in the current protocol. These mirror
+``driver.py``. If Microsoft changes them, adjust the JS templates below.
 """
 
 from __future__ import annotations
@@ -45,16 +45,24 @@ COPILOT_URL = "https://copilot.microsoft.com/"
 # Create a conversation. Runs in the page so cookies/Cloudflare apply.
 _CREATE_CONVERSATION_JS = """
 async () => {
-  const res = await fetch('/c/api/conversations', {
+  const res = await fetch('/c/api/start', {
     method: 'POST',
     credentials: 'include',
     headers: {'content-type': 'application/json'},
+    body: JSON.stringify({
+      timeZone: 'America/Los_Angeles',
+      startNewConversation: true,
+      teenSupportEnabled: true,
+      correctPersonalizationSetting: true,
+      performUserMerge: true,
+      deferredDataUseCapable: true
+    }),
   });
   const text = await res.text();
   if (!res.ok) return {ok: false, status: res.status, text: text};
   let data = {};
   try { data = JSON.parse(text); } catch (e) {}
-  return {ok: true, id: data.id || data.conversationId || null, raw: text};
+  return {ok: true, id: data.currentConversationId || data.id || data.conversationId || null, raw: text};
 }
 """
 
@@ -96,6 +104,7 @@ _START_STREAM_JS = """
   const state = {queue: [], done: false, error: null, started: false};
   window.__copilot = state;
   let url = 'wss://copilot.microsoft.com/c/api/chat?api-version=2';
+  url += '&clientSessionId=' + (self.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
   if (accessToken) url += '&accessToken=' + encodeURIComponent(accessToken);
   let ws;
   try { ws = new WebSocket(url); } catch (e) { state.error = 'ws-init: ' + e; state.done = true; return false; }
