@@ -121,7 +121,14 @@ _START_STREAM_JS = """
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     const e = msg.event;
-    if (e === 'appendText') { state.started = true; if (msg.text) state.queue.push(msg.text); }
+    if (e === 'challenge') {
+      // Acknowledge the gate (empty challenge -> empty token); never re-send the
+      // 'send' frame (a duplicate send is rejected as 'invalid-event').
+      if (!msg.method && !msg.parameter) {
+        try { ws.send(JSON.stringify({event: 'challengeResponse', token: '', method: msg.method, id: msg.id})); } catch (x) {}
+      }
+    }
+    else if (e === 'appendText') { state.started = true; if (msg.text) state.queue.push(msg.text); }
     else if (e === 'done') { state.done = true; try { ws.close(); } catch (x) {} }
     else if (e === 'error') { state.error = JSON.stringify(msg); state.done = true; try { ws.close(); } catch (x) {} }
   };

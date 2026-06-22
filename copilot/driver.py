@@ -22,6 +22,7 @@ from curl_cffi.requests import Session, CurlWsFlag
 # honour a deadline. CURL_SOCKET_BAD is libcurl's "no active socket" sentinel.
 _CURL_SOCKET_BAD = -1
 
+from .challenges import solve_copilot_challenge, solve_hashcash
 from .models import AbstractProvider, Conversation, ImageResponse, ImageType
 from .utils import drain_json, is_accepted_format, raise_for_status, to_bytes
 
@@ -54,8 +55,9 @@ class Copilot(AbstractProvider):
 
         Runs Copilot's own chat protocol over a Cloudflare-impersonating
         ``curl_cffi`` session: ``POST /c/api/start`` to open a conversation, then a
-        chat WebSocket (a single ``send`` frame -> ``appendText``* -> ``done``). No
-        browser and no proof-of-work step are required.
+        chat WebSocket (one ``send`` frame -> ``challenge`` ack -> ``appendText``* ->
+        ``done``). The challenge is acknowledged in-process; the message is sent once
+        and never re-sent. No browser is required.
 
         ``prompt`` is the user message sent straight to the chat socket (the
         protocol has no separate system/role channel). Anonymous by default;
@@ -173,6 +175,7 @@ class Copilot(AbstractProvider):
         """
         buffer = b""
         is_started = False
+        answered = False
         image_prompt = None
         last_msg = None
 
@@ -196,7 +199,26 @@ class Copilot(AbstractProvider):
             for msg in messages:
                 last_msg = msg
                 event = msg.get("event")
-                if event == "appendText":
+                if event == "challenge" and not answered:
+                    # The backend gates the reply behind a challenge frame we must
+                    # acknowledge. Answer it ONCE and do NOT re-send the 'send' frame:
+                    # the original message is already queued, and a second send is
+                    # what the backend rejects as "invalid-event".
+                    token = self._solve_challenge(msg)
+                    if token is None:
+                        raise RuntimeError(
+                            f"Unsolvable Copilot challenge (method={msg.get('method')!r}). "
+                            "Microsoft may have escalated to a browser-only challenge; "
+                            "fall back to copilot.browser.BrowserCopilot."
+                        )
+                    wss.send(json.dumps({
+                        "event": "challengeResponse",
+                        "token": token,
+                        "method": msg.get("method"),
+                        "id": msg.get("id"),
+                    }).encode(), CurlWsFlag.TEXT)
+                    answered = True
+                elif event == "appendText":
                     is_started = True
                     yield msg.get("text")
                 elif event == "generatingImage":
@@ -215,11 +237,10 @@ class Copilot(AbstractProvider):
                             "create_completion(..., proxy='http://user:pass@host:port')."
                         )
                     raise RuntimeError(f"Copilot error: {code}")
-                # Any other event (challenge, received, startMessage, partCompleted,
-                # connected, titleUpdate, suggestedFollowups, ...) is a benign ack in
-                # the redesigned protocol — ignore it. The backend no longer has a
-                # proof-of-work step; replying with a challengeResponse or sending a
-                # second 'send' frame is what the server rejects as "invalid-event".
+                # Other events (received, startMessage, partCompleted, connected,
+                # titleUpdate, suggestedFollowups, ...) are benign acks — ignore them.
+                # We answer 'challenge' above but never re-send the 'send' frame; the
+                # duplicate send is what the backend rejects as "invalid-event".
 
         if not is_started:
             raise RuntimeError(f"Invalid response: {last_msg}")
@@ -250,3 +271,25 @@ class Copilot(AbstractProvider):
                 if remaining <= 0:
                     return None
                 select([sock_fd], [], [], min(0.5, remaining))
+
+    @staticmethod
+    def _solve_challenge(msg: dict):
+        """Return the challenge-response token, or ``None`` if we can't solve it.
+
+        The chat socket gates the answer behind a challenge frame the client must
+        acknowledge (then it processes the already-sent message — do NOT re-send).
+        An *empty* challenge (no ``method``/``parameter``) just needs an empty-token
+        ack; the proof-of-work variants are computed in :mod:`copilot.challenges`. A
+        ``None`` return means a browser-solved token is needed (e.g. a Cloudflare
+        Turnstile) and the caller should surface that.
+        """
+        method = msg.get("method")
+        parameter = msg.get("parameter")
+        if not method and not parameter:
+            return ""  # empty/no-op challenge: just acknowledge it
+        if method == "hashcash" and parameter:
+            return solve_hashcash(parameter)
+        if method == "copilot" and parameter:
+            return solve_copilot_challenge(parameter)
+        # 'cloudflare' (Turnstile) / unknown PoW needs a browser-solved token.
+        return None
